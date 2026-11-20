@@ -1,10 +1,15 @@
 """随机矩形 + 负坐标 + 跨块场景下, 整块+边缘 与 全细格 结果必须完全一致。"""
 
 import random
+import sys
+from pathlib import Path
 
-from app.database import connect, init_db
-from app.ingest import Reading, ingest_batch
-from app.query import select_rectangle
+# 允许按 README 直接 `python scripts/random_check.py` 运行 (脚本目录并非仓库根)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.database import connect, init_db  # noqa: E402
+from app.ingest import Reading, ingest_batch  # noqa: E402
+from app.query import select_rectangle  # noqa: E402
 
 
 def main():

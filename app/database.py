@@ -86,6 +86,21 @@ CREATE TABLE IF NOT EXISTS block_stats (
     PRIMARY KEY (bx, by, phase)
 );
 
+-- 增量变更日志: 每 (期, 格) 只保留一行, 记录该格最后一次变更时的数据版本。
+-- 补测反复覆盖同一格只 UPDATE 这一行, 行数上界 = 出现过的格数, 不随补测次数增长。
+-- 批次被整批退回时事务回滚 / 或只写留痕, 本表不会留下任何行。
+CREATE TABLE IF NOT EXISTS cell_changes (
+    phase      TEXT NOT NULL CHECK (phase IN ('before', 'after')),
+    x          INTEGER NOT NULL,
+    y          INTEGER NOT NULL,
+    version    INTEGER NOT NULL,     -- 该格最后一次变更所属的数据版本
+    survey_no  INTEGER NOT NULL,     -- 与 version 同一份已提交快照的读数
+    depth_cm   INTEGER,              -- NULL = 空水深, 同样覆盖旧值并随增量下发
+    PRIMARY KEY (phase, x, y)
+);
+CREATE INDEX IF NOT EXISTS idx_cell_changes_version
+    ON cell_changes(version);
+
 -- 已接收批次留痕 (成功与失败都记录, 失败批次不改读数/统计)
 CREATE TABLE IF NOT EXISTS ingest_batches (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,7 +122,7 @@ CREATE TABLE IF NOT EXISTS meta (
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """建表并初始化数据版本。幂等, 含旧库补列迁移。"""
+    """建表并初始化数据版本。幂等, 含旧库补列/补增量日志迁移。"""
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
     # 旧版本数据库补配对指标列 (全新库跳过)
@@ -119,11 +134,49 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('data_version', '0')"
     )
+    _backfill_cell_changes(conn)
+
+
+def _backfill_cell_changes(conn: sqlite3.Connection) -> None:
+    """旧库存量读数补登增量日志 (各记一次"存在"变更)。
+
+    升级前已提交的读数没有变更记录; 用当前数据版本补一条, 保证初次
+    全量加载后从该版本续增量时仍能看到它们。以 ``meta`` 里的
+    ``cell_changes_backfilled`` 标记保证只做一次 (不在每次启动都全表扫描),
+    多进程同时启动时事务串行、INSERT OR IGNORE 幂等也不会写重。
+    """
+    done = conn.execute(
+        "SELECT value FROM meta WHERE key = 'cell_changes_backfilled'"
+    ).fetchone()
+    if done is not None:
+        return
+    version = max(get_data_version(conn), 1)
+    with write_transaction(conn, bump_version=False) as tx:
+        # 已存在变更记录的格不覆盖 (它们本就带着自己的版本号)
+        tx.execute(
+            "INSERT OR IGNORE INTO cell_changes"
+            "(phase, x, y, version, survey_no, depth_cm) "
+            "SELECT r.phase, r.x, r.y, ?, r.survey_no, r.depth_cm FROM readings r",
+            (version,),
+        )
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) "
+            "VALUES ('cell_changes_backfilled', '1')"
+        )
 
 
 def get_data_version(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT value FROM meta WHERE key = 'data_version'").fetchone()
     return int(row["value"]) if row else 0
+
+
+def next_data_version(conn: sqlite3.Connection) -> int:
+    """本次写事务提交后将生效的数据版本。
+
+    必须在 ``BEGIN IMMEDIATE`` 之后调用: 写事务已串行化, 期间不会有别的
+    写者推进版本, 因此事务内算出的值就是提交时写入的值; 事务回滚则一并作废。
+    """
+    return get_data_version(conn) + 1
 
 
 @contextmanager

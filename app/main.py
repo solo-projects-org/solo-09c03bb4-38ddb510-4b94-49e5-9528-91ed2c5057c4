@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config
 from .database import connect, get_data_version, init_db
 from .ingest import IngestError, ingest_batch, parse_csv, record_rejection
-from .query import QueryError, select_rectangle
+from .query import QueryError, changed_cells, full_grid, select_rectangle
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -84,9 +84,58 @@ async def upload_survey(
                 "rows_applied": result.rows_applied,
                 "rows_skipped_stale": result.rows_skipped_stale,
                 "blocks_touched": [list(b) for b in result.blocks_touched],
-                "data_version": get_data_version(conn),
+                "data_version": result.data_version,
             },
         )
+    finally:
+        conn.close()
+
+
+@app.get("/api/grid")
+def grid() -> dict:
+    """初次打开的全量格网 (坐标范围 + 两期全部读数 + 版本), 同一快照。"""
+    conn = connect()
+    try:
+        return full_grid(conn)
+    finally:
+        conn.close()
+
+
+@app.get("/api/grid/changes")
+def grid_changes(
+    since: int = Query(0, ge=0, description="上次成功显示的数据版本, 只取更新的变更"),
+    limit: int = Query(20000, ge=1, le=100000),
+    cursor_version: int | None = Query(None, ge=0),
+    cursor_phase: str | None = Query(None),
+    cursor_x: int | None = Query(None),
+    cursor_y: int | None = Query(None),
+) -> dict:
+    """网页"刷新格网": 只回传版本号 > since 的格变更, 读数与版本同一快照。
+
+    正常按 ``since`` 增量; 若库被重置导致版本倒退, 回 ``full_reload=true``
+    由客户端整图重载。单页未取完时携带 ``next_cursor`` 继续取, 取完才推进
+    版本, 保证不截断、不丢格。
+    """
+    cursor = None
+    if cursor_version is not None:
+        if cursor_phase not in ("before", "after"):
+            raise HTTPException(status_code=400, detail="cursor_phase 必须是 before/after")
+        if cursor_x is None or cursor_y is None:
+            raise HTTPException(status_code=400, detail="增量游标不完整")
+        cursor = {
+            "version": cursor_version, "phase": cursor_phase,
+            "x": cursor_x, "y": cursor_y,
+        }
+    conn = connect()
+    try:
+        result = changed_cells(conn, since, limit=limit, cursor=cursor)
+        return {
+            "since": result.since,
+            "data_version": result.data_version,
+            "full_reload": result.full_reload,
+            "changes": result.changes,
+            "next_cursor": result.next_cursor,
+        }
     finally:
         conn.close()
 

@@ -104,6 +104,88 @@ class ApiTest(unittest.IsolatedAsyncioTestCase):
             params={"x0": 0, "y0": 0, "x1": 15, "y1": 15})).json()
         self.assertEqual(r["area_cells_m2"], 255)
 
+    async def test_grid_full_and_incremental(self):
+        # 初次全量: /api/grid 一份快照给出范围 + 读数 + 版本
+        before_rows = [(x, y, 1, 200) for x in range(4) for y in range(3)]
+        await self._upload("before", before_rows)
+        await self._upload("after", before_rows)
+        full = (await self.client.get("/api/grid")).json()
+        self.assertEqual(len(full["cells"]), 24)
+        self.assertEqual(full["extent"]["before"]["x1"], 3)
+        v0 = full["data_version"]
+
+        # 增量: 只回传变更格, 空水深也回传 null
+        await self._upload("after", [(1, 1, 2, 250), (2, 2, 2, None)])
+        inc = (await self.client.get(
+            "/api/grid/changes", params={"since": v0})).json()
+        self.assertFalse(inc["full_reload"])
+        self.assertEqual(inc["data_version"], v0 + 1)
+        self.assertEqual(len(inc["changes"]), 2)
+        by_xy = {(c["x"], c["y"]): c for c in inc["changes"]}
+        self.assertEqual(by_xy[(1, 1)]["depth_cm"], 250)
+        self.assertIsNone(by_xy[(2, 2)]["depth_cm"])
+
+        # 再按新版本查: 无新变更
+        inc2 = (await self.client.get(
+            "/api/grid/changes", params={"since": inc["data_version"]})).json()
+        self.assertEqual(inc2["changes"], [])
+        self.assertEqual(inc2["data_version"], inc["data_version"])
+
+        # 退回批次不进增量、不推进版本
+        r = await self._upload("after", [(1, 1, 2, 999)])  # 同号(2)异值
+        self.assertEqual(r.status_code, 409)
+        inc3 = (await self.client.get(
+            "/api/grid/changes", params={"since": inc2["data_version"]})).json()
+        self.assertEqual(inc3["changes"], [])
+        self.assertEqual(inc3["data_version"], inc2["data_version"])
+
+        # 库被重置 (客户端版本比库还新) -> 要求整图重载
+        old = (await self.client.get(
+            "/api/grid/changes", params={"since": 10_000})).json()
+        self.assertTrue(old["full_reload"])
+
+    async def test_incremental_survives_app_restart(self):
+        # 版本号存库: 模拟服务重启 (新连接/重新 init_db) 后仍可按原版本增量
+        rows = [(x, y, 1, 200) for x in range(4) for y in range(4)]
+        await self._upload("before", rows)
+        await self._upload("after", rows)
+        v0 = (await self.client.get("/api/grid")).json()["data_version"]
+
+        await self.client.aclose()
+        conn = connect(self.db_path)
+        init_db(conn)
+        conn.close()
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+        await self._upload("after", [(0, 0, 2, 260)])
+        inc = (await self.client.get(
+            "/api/grid/changes", params={"since": v0})).json()
+        self.assertFalse(inc["full_reload"])
+        self.assertEqual(len(inc["changes"]), 1)
+        self.assertEqual(inc["changes"][0]["depth_cm"], 260)
+
+    async def test_incremental_pagination_over_http(self):
+        rows = [(x, 0, 1, 200) for x in range(30)]
+        await self._upload("before", rows)
+        v0 = (await self.client.get("/api/extent")).json()["data_version"]
+        await self._upload("after", [(x, 0, 1, 240) for x in range(30)])
+
+        seen = []
+        cursor = {}
+        for _ in range(10):
+            params = {"since": v0, "limit": 7, **cursor}
+            page = (await self.client.get("/api/grid/changes", params=params)).json()
+            seen.extend(c["x"] for c in page["changes"])
+            nc = page["next_cursor"]
+            if not nc:
+                break
+            cursor = {
+                "cursor_version": nc["version"], "cursor_phase": nc["phase"],
+                "cursor_x": nc["x"], "cursor_y": nc["y"],
+            }
+        self.assertEqual(sorted(seen), list(range(30)))
+
     async def test_bad_phase_and_bad_csv(self):
         self.assertEqual((await self._upload("middle", [(0, 0, 1, 1)])).status_code, 404)
         r = await self.client.post(

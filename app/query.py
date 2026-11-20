@@ -151,6 +151,107 @@ def _cellwise_aggregate(
     return int(row["n"]), int(row["d"])
 
 
+@dataclass
+class GridChanges:
+    """一次增量查询的结果, 读数与版本取自同一份已提交快照。"""
+
+    since: int
+    data_version: int
+    full_reload: bool               # 库被重置 (版本倒退), 客户端缓存不可信
+    changes: list[dict]             # phase/x/y/survey_no/depth_cm (空水深为 None)
+    next_cursor: dict | None        # 本页未取完时的续传游标, 取完为 None
+
+
+def changed_cells(
+    conn: sqlite3.Connection,
+    since: int,
+    limit: int = 20_000,
+    cursor: dict | None = None,
+) -> GridChanges:
+    """取数据版本 > since 的格变更 (网页"刷新格网"用)。
+
+    只返回版本号不大于 ``data_version`` 的最新变更, 二者在同一个只读事务内
+    读取, 因此读数与版本必然属于同一份已提交快照; 查询期间即使有补测提交,
+    下一次刷新也会带上新版本继续补齐。
+
+    每次刷新只传 ``cell_changes`` 里该格最新的一行: 反复补测同一格只更新
+    同一行, 增量数据量与额外存储都不随补测次数累积。
+
+    单页数量受 ``limit`` 限制, 未取完时返回 ``next_cursor``; 客户端以同一
+    ``since`` 加游标继续取, 直到 ``next_cursor`` 为 None 再推进基准版本,
+    因此同一版本的超大一批变更也不会被截断漏掉。
+
+    若库被重置 (当前版本反而小于 ``since``), 客户端缓存已不可信, 返回
+    ``full_reload=True``, 避免静默漏格。
+    """
+    since = max(int(since), 0)
+    with read_transaction(conn) as tx:
+        version = get_data_version(tx)
+        if version < since:
+            return GridChanges(since, version, True, [], None)
+
+        # 游标 (上一页末行) 用于续传: 按 (version, phase, x, y) 严格递增取下一页
+        cursor = cursor or {}
+        cv = int(cursor.get("version", 0))
+        cp = cursor.get("phase", "")
+        cx = int(cursor.get("x", 0))
+        cy = int(cursor.get("y", 0))
+        rows = tx.execute(
+            "SELECT phase, x, y, survey_no, depth_cm, version FROM cell_changes "
+            "WHERE version > :since AND version <= :version AND ("
+            "  version > :cv OR (version = :cv AND ("
+            "    phase > :cp OR (phase = :cp AND ("
+            "      x > :cx OR (x = :cx AND y > :cy)))))"
+            ") ORDER BY version, phase, x, y LIMIT :lim",
+            {
+                "since": since, "version": version, "cv": cv, "cp": cp,
+                "cx": cx, "cy": cy, "lim": limit,
+            },
+        ).fetchall()
+        changes = [
+            {
+                "phase": r["phase"], "x": r["x"], "y": r["y"],
+                "survey_no": r["survey_no"], "depth_cm": r["depth_cm"],
+            }
+            for r in rows
+        ]
+        next_cursor = None
+        if len(rows) >= limit:
+            last = rows[-1]
+            next_cursor = {
+                "version": last["version"], "phase": last["phase"],
+                "x": last["x"], "y": last["y"],
+            }
+        return GridChanges(since, version, False, changes, next_cursor)
+
+
+def full_grid(conn: sqlite3.Connection) -> dict:
+    """首次打开时的全量格网: 范围、全部读数与数据版本取自同一只读快照。
+
+    只用于"初次打开才加载全图"; 之后网页用 :func:`changed_cells` 增量补齐。
+    """
+    with read_transaction(conn) as tx:
+        version = get_data_version(tx)
+        extent: dict = {}
+        for phase in ("before", "after"):
+            row = tx.execute(
+                "SELECT MIN(x) AS x0, MIN(y) AS y0, MAX(x) AS x1, MAX(y) AS y1, "
+                "COUNT(*) AS n FROM readings WHERE phase = ?",
+                (phase,),
+            ).fetchone()
+            extent[phase] = (
+                {k: row[k] for k in ("x0", "y0", "x1", "y1")} if row["n"] else None
+            )
+        cells = tx.execute(
+            "SELECT x, y, phase, survey_no, depth_cm FROM readings ORDER BY x, y"
+        ).fetchall()
+        return {
+            "data_version": version,
+            "extent": extent,
+            "cells": [dict(r) for r in cells],
+        }
+
+
 def select_rectangle(
     conn: sqlite3.Connection,
     x0: int,

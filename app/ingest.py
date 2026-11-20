@@ -18,7 +18,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from . import config
-from .database import write_transaction
+from .database import next_data_version, write_transaction
 from .stats import block_of, recompute_blocks
 
 # 表头别名 -> 标准字段
@@ -65,6 +65,7 @@ class IngestResult:
     blocks_touched: list[tuple[int, int]] = field(default_factory=list)
     status: str = "accepted"
     reject_reason: str | None = None
+    data_version: int = 0           # 本批提交后的数据版本 (被退回时为 0, 不推进)
 
 
 def _parse_int(raw: str, field_name: str, line_no: int) -> int:
@@ -179,6 +180,8 @@ def ingest_batch(
     touched: set[tuple[int, int]] = set()
 
     with write_transaction(conn) as tx:
+        # 本批提交后的数据版本; 变更日志与读数在同一个事务内写下同一版本号
+        batch_version = next_data_version(tx)
         for r in readings:
             cur = tx.execute(
                 "SELECT survey_no, depth_cm FROM readings "
@@ -208,12 +211,23 @@ def ingest_batch(
                 "survey_no = excluded.survey_no, depth_cm = excluded.depth_cm",
                 (phase, r.x, r.y, r.survey_no, r.depth_cm),
             )
+            # 增量日志: 每格只留一行, 反复补测覆盖的是同一行, 存储不随次数增长;
+            # 空水深 (depth_cm=None) 也写, 客户端据此清掉旧显示值。
+            tx.execute(
+                "INSERT INTO cell_changes(phase, x, y, version, survey_no, depth_cm) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(phase, x, y) DO UPDATE SET "
+                "version = excluded.version, survey_no = excluded.survey_no, "
+                "depth_cm = excluded.depth_cm",
+                (phase, r.x, r.y, batch_version, r.survey_no, r.depth_cm),
+            )
             result.rows_applied += 1
             touched.add(block_of(r.x, r.y))
 
         recompute_blocks(tx, touched)
         result.blocks_touched = sorted(touched)
         _record_batch(tx, result)
+        result.data_version = batch_version
 
     return result
 
